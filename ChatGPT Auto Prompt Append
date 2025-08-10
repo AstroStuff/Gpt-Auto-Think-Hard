@@ -1,0 +1,299 @@
+// ==UserScript==
+// @name         ChatGPT Auto Prompt Append
+// @namespace    https://tampermonkey.net/
+// @version      1.5.0
+// @description  Append a visible blank line + "Use maximum reasoning for this." BEFORE send (Enter or Send). Toggle is anchored to the composer (left side, centered) so it doesn't overlap or jitter.
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  const PHRASE = "Use maximum reasoning for this.";
+  const STORAGE_KEY = "tm_thinkhard_enabled_v150";
+
+  let enabled = JSON.parse(localStorage.getItem(STORAGE_KEY) || "false");
+  let skipUntil = 0; // ignore our own synthetic submit
+
+  // ---------- Utilities ----------
+  const isVisible = (el) =>
+    !!el &&
+    el.offsetParent !== null &&
+    getComputedStyle(el).visibility !== "hidden" &&
+    getComputedStyle(el).display !== "none" &&
+    el.getBoundingClientRect().width > 0 &&
+    el.getBoundingClientRect().height > 0;
+
+  function getActiveInput() {
+    const nodes = [
+      ...document.querySelectorAll("form textarea"),
+      ...document.querySelectorAll('form [contenteditable="true"]'),
+      ...document.querySelectorAll('form [role="textbox"]')
+    ].filter(isVisible);
+    if (!nodes.length) return null;
+
+    // pick the composer near bottom
+    let best = null, d = Infinity;
+    for (const el of nodes) {
+      const r = el.getBoundingClientRect();
+      const dist = Math.abs(window.innerHeight - r.bottom);
+      if (dist < d) { d = dist; best = el; }
+    }
+    return best;
+  }
+
+  function composerFromEvent(e) {
+    const path = (e.composedPath ? e.composedPath() : []).concat(e.target);
+    for (const n of path) {
+      if (!(n instanceof Element)) continue;
+      if (n.tagName === "TEXTAREA") return n;
+      if (n.getAttribute && (n.getAttribute("contenteditable") === "true" || n.getAttribute("role") === "textbox")) return n;
+    }
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === "TEXTAREA" || ae.getAttribute?.("contenteditable") === "true" || ae.getAttribute?.("role") === "textbox")) return ae;
+    return getActiveInput();
+  }
+
+  const isTextarea = (el) => el && el.tagName === "TEXTAREA";
+
+  function setReactTextareaValue(textarea, value) {
+    const proto = Object.getPrototypeOf(textarea);
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) setter.call(textarea, value);
+    else textarea.value = value;
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function submitFormFor(el) {
+    const form = el.closest("form");
+    if (!form) return;
+    const btn =
+      form.querySelector('button[type="submit"]') ||
+      form.querySelector('button[aria-label*="Send" i]') ||
+      form.querySelector('button[data-testid*="send" i]');
+    if (btn) btn.click();
+    else form.requestSubmit ? form.requestSubmit() : form.submit();
+  }
+
+  const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const stripTrailingPhrase = (text) =>
+    (text || "")
+      .replace(new RegExp(`[\\s\\u00A0\\u200B\\u200C\\uFEFF]*${escRe(PHRASE)}\\s*$`, "u"), "")
+      .replace(/\s+$/u, "");
+
+  // ---------- Append logic ----------
+  function appendForTextarea(el) {
+    const current = el.value ?? "";
+    const base = stripTrailingPhrase(current);
+    const next = base ? `${base}\r\n\r\n${PHRASE}` : PHRASE;
+    setReactTextareaValue(el, next);
+  }
+
+  function escapeHTML(s) {
+    return s.replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+  }
+
+  function appendForContentEditable(el) {
+    // Normalize by removing existing trailing phrase (plain-text view)
+    const plain = el.innerText ?? "";
+    const base = stripTrailingPhrase(plain);
+
+    if (base !== plain) {
+      el.textContent = base;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    // Caret -> end
+    const doc = el.ownerDocument, win = doc.defaultView;
+    const range = doc.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const sel = win.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    const htmlVariants = [
+      `<p><br></p><p>${escapeHTML(PHRASE)}</p>`,
+      `<div><br></div><div>${escapeHTML(PHRASE)}</div>`,
+      `<br><br>${escapeHTML(PHRASE)}`
+    ];
+
+    const before = el.innerText;
+    for (const html of htmlVariants) {
+      doc.execCommand("insertHTML", false, html);
+      if ((el.innerText ?? "") !== before) break;
+    }
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  function appendSuffix(el) {
+    if (!el) return;
+    if (isTextarea(el)) appendForTextarea(el);
+    else appendForContentEditable(el);
+  }
+
+  // Ensure React/Slate processes the change before we submit.
+  function afterReactFlush(fn) {
+    (queueMicrotask || ((cb)=>Promise.resolve().then(cb)))(() =>
+      requestAnimationFrame(() => fn())
+    );
+  }
+
+  // ---------- Toggle UI (shadow DOM) ----------
+  let host, shadow, checkbox;
+
+  function createToggle() {
+    if (host) return host;
+    host = document.createElement("div");
+    // start off-screen to avoid flashing before anchoring
+    host.style.position = "fixed";
+    host.style.left = "-9999px";
+    host.style.top = "0";
+    host.style.pointerEvents = "auto";
+    host.style.zIndex = "2147483647";
+
+    shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        .chip{display:inline-flex;align-items:center;gap:10px;padding:8px 10px;border-radius:999px;
+          background:rgba(25,25,25,.85);color:#fff;font:500 12px/1 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+          box-shadow:0 4px 16px rgba(0,0,0,.18);user-select:none;backdrop-filter:blur(6px);cursor:pointer;white-space:nowrap}
+        .sw{position:relative;width:38px;height:22px;border-radius:999px;background:#6b7280;transition:background .2s;flex:0 0 auto}
+        .sw::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .2s}
+        input{display:none}
+        input:checked + .sw{background:#22c55e}
+        input:checked + .sw::after{transform:translateX(16px)}
+      </style>
+      <label class="chip" title="Append blank line + ‘${PHRASE}’ to every send">
+        <span>Think Hard</span>
+        <input type="checkbox" ${enabled ? "checked" : ""}/>
+        <span class="sw" aria-hidden="true"></span>
+      </label>
+    `;
+    checkbox = shadow.querySelector("input");
+    checkbox.addEventListener("change", () => {
+      enabled = checkbox.checked;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(enabled));
+    });
+    document.body.appendChild(host);
+    return host;
+  }
+
+  // ---------- Anchor the chip to the composer (no jank) ----------
+  // Pin the chip inside the <form>, left of the composer, vertically centered.
+  const GAP_PX = 24; // horizontal spacing between chip and chatbox
+
+  // Pin the chip inside the <form>, just LEFT of the composer, anchored to its BOTTOM (no vertical drift).
+const BOTTOM_OFFSET = 10; // vertical space above the bottom edge of the composer
+
+function anchorToComposer() {
+  createToggle();
+  const input = getActiveInput();
+  if (!input) return;
+
+  const form = input.closest("form");
+  if (!form) return;
+
+  if (host.parentNode !== form) form.appendChild(host);
+
+  const cs = getComputedStyle(form);
+  if (cs.position === "static") form.style.position = "relative";
+  if (cs.overflow !== "visible") form.style.overflow = "visible";
+
+  // Bottom-anchored placement (stable even when the composer grows upward)
+  host.style.position = "absolute";
+  host.style.top = "auto";
+  host.style.bottom = `${BOTTOM_OFFSET}px`; // <-- fixed to bottom
+  host.style.left = "0";
+  host.style.right = "auto";
+  host.style.transform = `translate(calc(-100% - ${GAP_PX}px), 0)`; // just to the left
+  host.style.zIndex = "2147483647";
+  host.style.willChange = "transform";
+}
+
+  // Thin wrappers so existing observers just re-anchor
+  let rafId = 0;
+  function repositionToggle() { anchorToComposer(); }
+  function scheduleReposition() {
+    cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(anchorToComposer);
+  }
+
+  // ---------- Event hooks ----------
+  function onKeydownCapture(e) {
+    if (!enabled) return;
+    if (e.isComposing) return;
+    if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+
+    const input = composerFromEvent(e);
+    if (!input) return;
+
+    // PREEMPT: stop native send, then append and submit ourselves
+    e.preventDefault();
+    e.stopPropagation();
+
+    appendSuffix(input);
+    skipUntil = performance.now() + 800;
+    afterReactFlush(() => submitFormFor(input));
+  }
+
+  function onPointerDownCapture(e) {
+    if (!enabled) return;
+    if (performance.now() < skipUntil) return; // synthetic submit guard
+
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    const isSend =
+      t.closest('button[type="submit"]') ||
+      t.closest('button[aria-label*="Send" i]') ||
+      t.closest('button[data-testid*="send" i]');
+    if (!isSend) return;
+
+    const input = getActiveInput();
+    if (!input) return;
+
+    // append BEFORE the click handler runs
+    appendSuffix(input);
+    // let the click proceed naturally; React will read the updated value after our microtask+rAF
+    afterReactFlush(() => {});
+  }
+
+  function onSubmitCapture(e) {
+    if (!enabled) return;
+    if (performance.now() < skipUntil) return; // our own submit path already handled
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const input = getActiveInput();
+    if (!input) return;
+    appendSuffix(input);
+  }
+
+  // ---------- Bootstrap ----------
+  function start() {
+    createToggle();
+    anchorToComposer();
+
+    const mo = new MutationObserver(() => scheduleReposition());
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    // Re-anchor when layout/composer changes
+    window.addEventListener("resize", scheduleReposition, { passive: true });
+    window.addEventListener("scroll", scheduleReposition, { passive: true });
+    document.addEventListener("focusin", scheduleReposition, { passive: true });
+    document.addEventListener("visibilitychange", scheduleReposition);
+
+    // PREEMPT paths
+    document.addEventListener("keydown", onKeydownCapture, { capture: true });
+    document.addEventListener("pointerdown", onPointerDownCapture, { capture: true });
+    document.addEventListener("submit", onSubmitCapture, { capture: true });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
